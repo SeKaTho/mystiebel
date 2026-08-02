@@ -84,6 +84,28 @@ EXCLUDED_INDIVIDUAL_SENSORS = {
     2483,  # Hours
 }
 
+# --- Hot Water Plus fix (register 2487 silently reverting) ---
+#
+# The stock MyStiebel app writes register 2394 (an absolute end-timestamp,
+# in the same clock/epoch base as register 2391, the device's live "now"
+# register) a few dozen milliseconds *before* flipping register 2487
+# (the Hot Water Plus on/off flag). Toggling 2487 alone - which is all this
+# integration previously did - leaves the device without a valid end time,
+# so the device silently reverts the flag back to 0 after a few seconds.
+#
+# Confirmed empirically: activating via the app for a 3 hour duration wrote
+# register 2394 to a value that was ~10740 seconds (~2h59m, matching
+# rounding) ahead of the simultaneous value of register 2391.
+HOT_WATER_PLUS_SWITCH_REGISTER = 2487  # Hot Water Plus Requested (Switch)
+HOT_WATER_PLUS_END_TIME_REGISTER = 2394  # Absolute end-timestamp, device clock base
+DEVICE_CLOCK_REGISTER = 2391  # Device's live "now", same base as register 2394
+
+# The MyStiebel app enforces a minimum of 3 hours for Hot Water Plus; we mirror
+# that here rather than allowing shorter (untested/possibly rejected) values.
+HOT_WATER_PLUS_MIN_DURATION_HOURS = 3
+HOT_WATER_PLUS_MAX_DURATION_HOURS = 24
+HOT_WATER_PLUS_DEFAULT_DURATION_HOURS = 3
+
 # --- Centralized Mappings ---
 
 UNIT_MAP = {
