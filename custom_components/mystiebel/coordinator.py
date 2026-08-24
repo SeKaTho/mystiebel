@@ -6,14 +6,15 @@ from asyncio import Event, Lock
 from datetime import datetime, timedelta
 from typing import Any
 
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN
+from .const import DOMAIN, MAX_DATA_STALENESS
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class MyStiebelCoordinator(DataUpdateCoordinator):
+
     def __init__(
         self,
         hass,
@@ -29,7 +30,13 @@ class MyStiebelCoordinator(DataUpdateCoordinator):
         shower_output: int,
     ) -> None:
         """Initialize the MyStiebel coordinator."""
-        super().__init__(hass, _LOGGER, name=DOMAIN)
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_method=self._async_update_data,
+            update_interval=timedelta(minutes=1),
+        )
         self.session = session
         self.token = token
         self.installation_id = installation_id
@@ -40,30 +47,73 @@ class MyStiebelCoordinator(DataUpdateCoordinator):
         self.mac_address = mac_address
         self.bath_volume = bath_volume
         self.shower_output = shower_output
+
         self.entities: dict[str, Any] = {}
         self.data: dict[int, Any] = {}
         self.parameters: dict[int, Any] = {}
         self.alarms: dict[int, Any] = {}
         self.active_fields: list[int] = []
+
         self.ready_event = Event()
         self.ws = None
         self._data_lock = Lock()
         self._last_ha_update = datetime.now()
         self._stale_threshold = timedelta(seconds=60)  # Update HA at least every minute
+        self._last_confirmed_fresh = datetime.now()
+        self._max_staleness = timedelta(seconds=MAX_DATA_STALENESS)
 
     async def _async_update_data(self) -> dict[int, Any]:
-        """Return the current data."""
+        """Fetch fresh data from the MyStiebel WebSocket or return last snapshot."""
         async with self._data_lock:
+            if self.ws and not self.ws.closed:
+                try:
+                    from .websocket_client import GET_VALUES_MSG
+
+                    message = GET_VALUES_MSG(
+                        self.installation_id,
+                        list(self.active_fields) if self.active_fields else [],
+                    )
+                    await self.ws.send_json(message)
+                    _LOGGER.debug("Sent getValues request via WebSocket")
+                except Exception as err:
+                    _LOGGER.error("Error sending getValues request: %s", err)
+            else:
+                _LOGGER.debug("WebSocket not connected during update poll")
+
+            # If we haven't had a single confirmed-fresh message (valuesChanged
+            # push or answered getValues poll) in too long, stop pretending the
+            # cached snapshot is current. This lets HA mark entities unavailable
+            # instead of silently repeating stale values forever.
+            staleness = datetime.now() - self._last_confirmed_fresh
+            if staleness > self._max_staleness:
+                raise UpdateFailed(
+                    f"No confirmed fresh WebSocket data since "
+                    f"{self._last_confirmed_fresh.isoformat()} "
+                    f"({int(staleness.total_seconds())}s, threshold "
+                    f"{int(self._max_staleness.total_seconds())}s)"
+                )
+
+            # Always deliver current data to HA, even if unchanged this cycle,
+            # so entities never sit stale between valuesChanged pushes.
+            self.async_set_updated_data(self.data.copy())
             return self.data.copy()
 
     def process_data_update(self, data_updates: list[dict[str, Any]]) -> None:
         """Process incoming data updates in a thread-safe manner."""
+
         async def _update() -> None:
             async with self._data_lock:
+                # Being invoked at all means a WebSocket message with real
+                # data arrived (valuesChanged push or answered getValues
+                # poll) - the connection is proven alive, regardless of
+                # whether any individual register value actually changed.
+                self._last_confirmed_fresh = datetime.now()
+
                 changed = False
                 for update in data_updates:
                     register = update.get("registerIndex")
                     value = update.get("displayValue")
+
                     if register is not None:
                         # Check if value actually changed
                         if self.data.get(register) != value:
@@ -80,7 +130,6 @@ class MyStiebelCoordinator(DataUpdateCoordinator):
                 if should_update:
                     self.async_set_updated_data(self.data.copy())
                     self._last_ha_update = datetime.now()
-
                     if not changed:
                         _LOGGER.debug(
                             "Heartbeat update sent to HA (no data changes for %s seconds)",
@@ -88,7 +137,22 @@ class MyStiebelCoordinator(DataUpdateCoordinator):
                         )
 
         # Schedule the update in the event loop
-        asyncio.create_task(_update())
+        task = asyncio.create_task(_update())
+        task.add_done_callback(self._log_task_exception)
+
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task) -> None:
+        """Surface exceptions from process_data_update's background task.
+
+        Without this, a parsing error in a single update is silently
+        swallowed and no further values are processed until the next
+        WebSocket reconnect.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _LOGGER.error("Error processing data update: %s", exc, exc_info=exc)
 
     def set_websocket(self, ws: Any) -> None:
         """Set the WebSocket connection."""
@@ -109,7 +173,6 @@ class MyStiebelCoordinator(DataUpdateCoordinator):
                 self.installation_id, self.client_id, register_index, value
             )
             _LOGGER.debug("Sending setValues message for register %d", register_index)
-
             try:
                 await self.ws.send_json(message)
                 # Optimistically update the local data
