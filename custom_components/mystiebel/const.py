@@ -3,6 +3,7 @@
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 
 DOMAIN = "mystiebel"
+
 WS_URL = "wss://serviceapi.mystiebel.com/ws/v1"
 
 # API Configuration
@@ -18,6 +19,8 @@ USER_AGENT = f"{APP_NAME}/2.3.0 Dalvik/2.1.0"
 WEBSOCKET_HEARTBEAT = 30  # seconds
 WEBSOCKET_RECONNECT_INITIAL = 5  # seconds
 WEBSOCKET_RECONNECT_MAX = 300  # 5 minutes
+WEBSOCKET_DATA_TIMEOUT = 300  # 5 minutes — force reconnect if no message (any type) arrives
+MAX_DATA_STALENESS = 600  # 10 minutes — coordinator reports UpdateFailed beyond this
 TOKEN_REFRESH_MARGIN = 300  # Refresh token 5 minutes before expiry
 API_RATE_LIMIT_DELAY = 1  # Minimum seconds between API calls
 
@@ -38,6 +41,8 @@ ESSENTIAL_SENSORS = [
     1111,  # Compressor (state)
     1116,  # Heating Element (state)
     1130,  # Defrosting (state)
+    2370,  # Integral Temperature
+    2372,  # Air Inlet Temperature
 ]
 
 # List of essential control entities (switches, numbers, selects).
@@ -49,7 +54,7 @@ ESSENTIAL_CONTROLS = [
     2382,  # Boost Request (Select)
     2487,  # Hot Water Plus Requested (Switch)
     2498,  # Weekly Hygiene Program Requested (Switch)
-    2384,  # Frost Protection Requested (Switch)
+    2384,  # Standby / Frost Protection Requested (Switch) — see #9
     2481,  # End of Vacation (Switch)
 ]
 
