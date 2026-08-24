@@ -7,6 +7,7 @@ import random
 from typing import Any
 
 import aiohttp
+
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -17,6 +18,7 @@ from .const import (
     MSG_ID_MAX,
     MSG_ID_MIN,
     USER_AGENT,
+    WEBSOCKET_DATA_TIMEOUT,
     WEBSOCKET_HEARTBEAT,
     WEBSOCKET_RECONNECT_INITIAL,
     WEBSOCKET_RECONNECT_MAX,
@@ -81,6 +83,12 @@ class WebSocketClient:
             self._run(),
             "mystiebel_websocket"
         )
+
+    async def restart(self) -> None:
+        """Restart the WebSocket client cleanly."""
+        await self.stop()
+        self._running = True
+        self.start()
 
     async def stop(self) -> None:
         """Stop the WebSocket client."""
@@ -169,10 +177,10 @@ class WebSocketClient:
 
     async def _authenticate(self) -> None:
         """Authenticate and update token."""
-        _LOGGER.debug("Authenticating for WebSocket connection")
-        await self.auth.authenticate()
+        _LOGGER.debug("Authenticating for WebSocket connection if token not valid")
+        await self.auth.ensure_valid_token()
         self.coordinator.set_token(self.auth.token)
-        _LOGGER.debug("Authentication successful")
+        _LOGGER.debug("(Re-)authentication successful")
 
     async def _create_connection(self) -> aiohttp.ClientWebSocketResponse:
         """Create WebSocket connection with proper headers."""
@@ -182,7 +190,6 @@ class WebSocketClient:
             "X-SC-ClientApp-Version": APP_VERSION_ANDROID,
             "User-Agent": USER_AGENT,
         }
-
         ws = await self.session.ws_connect(
             WS_URL, headers=headers, heartbeat=WEBSOCKET_HEARTBEAT
         )
@@ -204,8 +211,27 @@ class WebSocketClient:
         _LOGGER.debug("WebSocket login message sent")
 
     async def _listen_to_messages(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """Listen for and handle incoming WebSocket messages."""
-        async for msg in ws:
+        """Listen for and handle incoming WebSocket messages, with a data-level watchdog.
+
+        aiohttp's transport-level heartbeat only detects a dead TCP/WS connection.
+        It does not detect the case where the connection stays technically alive
+        (ping/pong keeps succeeding) but the MyStiebel cloud silently stops
+        pushing valuesChanged events or answering getValues polls. This loop
+        additionally times out if *no* message of any kind arrives within
+        WEBSOCKET_DATA_TIMEOUT, and forces a reconnect in that case.
+        """
+        while True:
+            try:
+                msg = await ws.receive(timeout=WEBSOCKET_DATA_TIMEOUT)
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "No WebSocket data received for %s seconds despite an "
+                    "apparently healthy connection - forcing reconnect",
+                    WEBSOCKET_DATA_TIMEOUT,
+                )
+                await ws.close()
+                break
+
             if msg.type == aiohttp.WSMsgType.TEXT:
                 await self._handle_text_message(ws, msg.data)
             elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -276,8 +302,33 @@ class WebSocketClient:
     async def _handle_value_update(self, data: dict[str, Any]) -> None:
         """Handle value change notification."""
         params = data.get("params", {})
-        _LOGGER.debug("Value update received: %s", params)
-        self.coordinator.process_data_update([params])
+        _LOGGER.debug("Raw valuesChanged params: %s", params)
+
+        updates = self._normalize_value_updates(params)
+        if not updates:
+            _LOGGER.warning("Unrecognized valuesChanged payload shape: %s", params)
+            return
+
+        self.coordinator.process_data_update(updates)
+
+    @staticmethod
+    def _normalize_value_updates(params: Any) -> list[dict[str, Any]]:
+        """Normalize a valuesChanged payload into a list of {registerIndex, displayValue} dicts.
+
+        The API has been observed sending either a single flat update, or a
+        batch nested under "fields" (matching the shape used by the initial
+        getValues response). Handle both so a shape change doesn't silently
+        drop every subsequent update until the next reconnect.
+        """
+        if isinstance(params, list):
+            return params
+        if isinstance(params, dict):
+            fields = params.get("fields")
+            if isinstance(fields, list):
+                return fields
+            if "registerIndex" in params:
+                return [params]
+        return []
 
     def _create_get_values_msg(self) -> dict[str, Any]:
         """Create a getValues message."""
@@ -363,5 +414,25 @@ def SET_VALUE_MSG(
             "UUID": client_id,
             "listenWithValuesChanged": True,
             "fields": [{"registerIndex": register_index, "displayValue": value}],
+        },
+    }
+
+
+def GET_VALUES_MSG(
+    installation_id: str, registers: list[int] | None = None
+) -> dict[str, Any]:
+    """Create a getValues message.
+
+    Requests the current values from the device. Used by the coordinator's
+    periodic poll as a safety net alongside the WebSocket's push-based
+    valuesChanged updates.
+    """
+    return {
+        "jsonrpc": "2.0",
+        "id": _generate_message_id(long_format=True),
+        "method": "getValues",
+        "params": {
+            "installationId": int(installation_id),
+            "fields": registers if registers else [],
         },
     }
