@@ -84,6 +84,19 @@ class WebSocketClient:
             "mystiebel_websocket"
         )
 
+    @property
+    def is_dead(self) -> bool:
+        """True if the background task ended unexpectedly while it should still be running.
+
+        Normally _run() loops forever, reconnecting with backoff on any error.
+        If something causes the task to exit without going through stop()
+        (e.g. an unexpected CancelledError from outside our own control), the
+        client silently stops updating data with no further log output. A
+        supervisor (the coordinator) can poll this property and call
+        restart() to recover instead of staying dead indefinitely.
+        """
+        return self._running and self._task is not None and self._task.done()
+
     async def restart(self) -> None:
         """Restart the WebSocket client cleanly."""
         await self.stop()
