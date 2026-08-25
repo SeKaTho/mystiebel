@@ -56,6 +56,7 @@ class MyStiebelCoordinator(DataUpdateCoordinator):
 
         self.ready_event = Event()
         self.ws = None
+        self.websocket_client = None  # set externally in __init__.py after construction
         self._data_lock = Lock()
         self._last_ha_update = datetime.now()
         self._stale_threshold = timedelta(seconds=60)  # Update HA at least every minute
@@ -65,6 +66,17 @@ class MyStiebelCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> dict[int, Any]:
         """Fetch fresh data from the MyStiebel WebSocket or return last snapshot."""
         async with self._data_lock:
+            # Supervisor: recover if the background WebSocket task died
+            # unexpectedly (e.g. a stray CancelledError) instead of going
+            # through its own reconnect loop. Without this, such a death is
+            # silent and permanent until the integration is manually reloaded.
+            ws_client = self.websocket_client
+            if ws_client is not None and ws_client.is_dead:
+                _LOGGER.warning(
+                    "WebSocket client background task ended unexpectedly - restarting it"
+                )
+                await ws_client.restart()
+
             if self.ws and not self.ws.closed:
                 try:
                     from .websocket_client import GET_VALUES_MSG
