@@ -265,6 +265,8 @@ class WebSocketClient:
             # Route to appropriate handler based on message type
             if self._is_login_response(data):
                 await self._handle_login_response(ws)
+            elif self._is_error_response(data):
+                await self._handle_error_response(ws, data)
             elif self._is_initial_data(data):
                 await self._handle_initial_data(ws, data)
             elif self._is_value_update(data):
@@ -276,6 +278,21 @@ class WebSocketClient:
     def _is_login_response(self, data: dict[str, Any]) -> bool:
         """Check if message is a login response."""
         return data.get("id") == 1 and data.get("result") is True
+
+    def _is_error_response(self, data: dict[str, Any]) -> bool:
+        """Check if a response indicates a server-side error rather than real data.
+
+        The API can answer a request (e.g. a periodic getValues poll) with an
+        "errorCode" inside an otherwise success-shaped result, together with
+        an empty "fields" list. That shape also satisfies _is_initial_data()'s
+        check, and - if not caught here first - would be misinterpreted as a
+        confirmed-fresh (if empty) data update, silently resetting the
+        coordinator's staleness watchdog every poll cycle even though no real
+        data has arrived. Observed in the wild as errorCode -10000 repeating
+        on every poll for hours while the underlying subscription was dead.
+        """
+        result = data.get("result")
+        return isinstance(result, dict) and result.get("errorCode") not in (None, 0)
 
     def _is_initial_data(self, data: dict[str, Any]) -> bool:
         """Check if message contains initial data."""
@@ -296,6 +313,26 @@ class WebSocketClient:
         msg = self._create_get_values_msg()
         await ws.send_json(msg)
         _LOGGER.debug("Requested initial values")
+
+    async def _handle_error_response(
+        self, ws: aiohttp.ClientWebSocketResponse, data: dict[str, Any]
+    ) -> None:
+        """Handle an API-level error response (e.g. a stuck/rejected subscription).
+
+        A getValues or Subscribe request answered with a non-zero errorCode
+        must NOT be treated as confirmed-fresh data - doing so would silently
+        mask a dead subscription from the coordinator's staleness watchdog.
+        A persistently erroring session has not been observed to recover on
+        its own, so force a reconnect rather than retrying the same broken
+        session every poll cycle.
+        """
+        error_code = data.get("result", {}).get("errorCode")
+        _LOGGER.warning(
+            "MyStiebel API returned errorCode %s for request id %s - forcing reconnect",
+            error_code,
+            data.get("id"),
+        )
+        await ws.close()
 
     async def _handle_initial_data(
         self, ws: aiohttp.ClientWebSocketResponse, data: dict[str, Any]
