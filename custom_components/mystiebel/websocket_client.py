@@ -267,6 +267,8 @@ class WebSocketClient:
                 await self._handle_login_response(ws)
             elif self._is_error_response(data):
                 await self._handle_error_response(ws, data)
+            elif self._is_poll_response(data):
+                await self._handle_poll_response(data)
             elif self._is_initial_data(data):
                 await self._handle_initial_data(ws, data)
             elif self._is_value_update(data):
@@ -295,10 +297,40 @@ class WebSocketClient:
         return isinstance(result, dict) and result.get("errorCode") not in (None, 0)
 
     def _is_initial_data(self, data: dict[str, Any]) -> bool:
-        """Check if message contains initial data."""
+        """Check if message contains initial data.
+
+        NOTE: this shape (`"fields"` present in `result`) is also produced by
+        the coordinator's periodic getValues poll. _is_poll_response() must be
+        checked first so poll responses aren't misrouted here.
+        """
         result = data.get("result", {})
         return (
             data.get("id") is not None
+            and isinstance(result, dict)
+            and "fields" in result
+        )
+
+    def _is_poll_response(self, data: dict[str, Any]) -> bool:
+        """Check if this is a response to the coordinator's periodic getValues poll.
+
+        The coordinator's 60s poll (GET_VALUES_MSG, module-level function) and
+        the one-time post-login initial data fetch (_create_get_values_msg,
+        instance method) both answer with the same {"result": {"fields": [...]}}
+        shape - the only reliable way to tell them apart is the message ID
+        range, since the poll always uses long-format IDs
+        (_generate_message_id(long_format=True), >= MSG_ID_LONG_MIN) while the
+        post-login fetch uses short-format IDs. Routing poll responses through
+        _handle_initial_data would incorrectly re-send a Subscribe message
+        every single poll cycle (every 60s) to an already-active channel -
+        repeatedly re-subscribing like this appears to be what eventually
+        causes the MyStiebel API to start rejecting requests with a
+        persistent errorCode.
+        """
+        msg_id = data.get("id")
+        result = data.get("result")
+        return (
+            isinstance(msg_id, int)
+            and msg_id >= MSG_ID_LONG_MIN
             and isinstance(result, dict)
             and "fields" in result
         )
@@ -348,6 +380,16 @@ class WebSocketClient:
         msg = self._create_subscribe_msg()
         await ws.send_json(msg)
         _LOGGER.debug("Subscribed to value updates")
+
+    async def _handle_poll_response(self, data: dict[str, Any]) -> None:
+        """Handle a response to the coordinator's periodic getValues poll.
+
+        Unlike the one-time post-login initial data fetch, this must NOT
+        re-send a Subscribe message - see _is_poll_response() for why.
+        """
+        fields = data["result"]["fields"]
+        _LOGGER.debug("Poll response received with %d values", len(fields))
+        self.coordinator.process_data_update(fields)
 
     async def _handle_value_update(self, data: dict[str, Any]) -> None:
         """Handle value change notification."""
