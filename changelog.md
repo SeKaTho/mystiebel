@@ -17,6 +17,16 @@
   running `_run()` appears to exit (most likely via an unexpected
   `CancelledError` outside of `stop()`) without restarting itself, leaving
   `self.ws` permanently `None` with no supervisor to notice.
+- **API error responses silently defeating the staleness watchdog**
+  ([#XX](link-to-issue)): when the MyStiebel API answers a periodic
+  `getValues` poll with `{"fields": [], "errorCode": -10000}` (subscription
+  stuck/rejected server-side, connection itself still "alive"), the response
+  shape also satisfied `_is_initial_data()`'s check and was processed as a
+  confirmed-fresh (if empty) data update. This reset the coordinator's
+  `_last_confirmed_fresh` timestamp every poll cycle, which meant our own
+  staleness `UpdateFailed` safety net never triggered even though no real
+  data had arrived for hours — the freeze-masking bug the watchdog was built
+  to catch, reintroduced by the watchdog's own success path.
 
 ### Added
 - **Data-level WebSocket watchdog** (`websocket_client.py`): `_listen_to_messages`
@@ -37,6 +47,11 @@
   own. If so, the coordinator now calls `restart()` on it automatically,
   bounding recovery time to roughly one poll interval instead of requiring a
   manual integration reload.
+- **API error-response detection** (`websocket_client.py`): a new
+  `_is_error_response`/`_handle_error_response` path is now checked before
+  `_is_initial_data`, so a response carrying a non-zero `errorCode` is no
+  longer misread as valid (if empty) data. It now logs a warning with the
+  error code and forces a reconnect instead.
 - New constants `WEBSOCKET_DATA_TIMEOUT` (300s) and `MAX_DATA_STALENESS`
   (600s) in `const.py`, layered so the WebSocket-level reconnect and the new
   task supervisor both get a chance to self-heal before the coordinator
