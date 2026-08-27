@@ -27,8 +27,8 @@
   staleness `UpdateFailed` safety net never triggered even though no real
   data had arrived for hours — the freeze-masking bug the watchdog was built
   to catch, reintroduced by the watchdog's own success path.
-- **Root cause: periodic poll responses misrouted as "initial data",
-  triggering a redundant re-Subscribe every 60 seconds**
+- **Root cause: periodic poll responses misrouted as "initial data", triggering
+  a redundant re-Subscribe every 60 seconds**
   ([#XX](link-to-issue)): `_is_initial_data()` only checked the response
   *shape* (`"fields"` present in `result`), which is identical for the
   one-time post-login data fetch and for every answer to the coordinator's
@@ -38,6 +38,21 @@
   what eventually causes the MyStiebel API to start rejecting requests with
   a persistent `errorCode` — the likely root cause behind the periodic
   freezes reported over the past weeks, pre-dating this fix branch.
+- **Instant, backoff-free reconnects on `errorCode`/login rejection turning
+  a single glitch into an hours-long total outage** ([#XX](link-to-issue)):
+  the error-response handling added above reconnected immediately with no
+  delay. Once triggered, the fresh connection's login was then rejected by
+  the API (`{"id": 1, "result": false}`) — a case not handled at all, so it
+  was silently dropped and the client sat idle until the next 60s poll
+  repeated the same failing `getValues` → reconnect cycle indefinitely, with
+  no data ever getting through and all entities eventually going
+  `unavailable`. Root cause: `MyStiebelAuth.ensure_valid_token()`
+  (`mystiebel_auth.py`) only tracks a hardcoded, assumed 24h token lifetime
+  rather than the token's real server-side validity, so it kept reusing the
+  same already-rejected token on every reconnect attempt. Both failure paths
+  now explicitly clear the cached token (forcing a genuine re-authentication)
+  on login rejection and apply exponential backoff instead of reconnecting
+  instantly.
 
 ### Added
 - **Data-level WebSocket watchdog** (`websocket_client.py`): `_listen_to_messages`
@@ -70,6 +85,16 @@
   responses now update data without re-sending a `Subscribe` message,
   removing the redundant every-60-seconds re-subscription that appears to be
   the actual root cause of the periodic freezes.
+- **Login-rejection handling and exponential backoff for error paths**
+  (`websocket_client.py`): a new `_is_login_failure`/`_handle_login_failure`
+  path detects an explicit `{"id": 1, "result": false}` login rejection
+  (previously silently dropped), clears the cached token on the shared
+  `MyStiebelAuth` instance so the next attempt is forced to fully
+  re-authenticate, and raises a new internal `_ReconnectWithBackoff` signal.
+  Both this and the existing `errorCode` handling now reconnect through the
+  normal exponential-backoff path (`_handle_reconnect`) instead of instantly,
+  preventing a single glitch from turning into a tight, indefinite
+  fail-reconnect-fail loop.
 - New constants `WEBSOCKET_DATA_TIMEOUT` (300s) and `MAX_DATA_STALENESS`
   (600s) in `const.py`, layered so the WebSocket-level reconnect and the new
   task supervisor both get a chance to self-heal before the coordinator
