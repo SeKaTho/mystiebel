@@ -31,6 +31,17 @@ _LOGGER = logging.getLogger(__name__)
 _used_message_ids: set[int] = set()
 
 
+class _ReconnectWithBackoff(Exception):
+    """Internal signal: exit the listen loop and reconnect with exponential backoff.
+
+    Used for failure conditions that must not be retried immediately (API
+    errorCode responses, explicit login rejection) - unlike a clean
+    CLOSE/ERROR frame, which already goes through the normal immediate-retry
+    path in _run(). Retrying these instantly, over and over, is what turned a
+    single glitch into an hours-long outage in practice.
+    """
+
+
 def _generate_message_id(long_format: bool = False) -> int:
     """Generate a unique message ID with collision detection."""
     min_val = MSG_ID_LONG_MIN if long_format else MSG_ID_MIN
@@ -178,6 +189,9 @@ class WebSocketClient:
             # Re-raise cancellation to propagate it
             _LOGGER.debug("Connection cancelled")
             raise
+        except _ReconnectWithBackoff as e:
+            _LOGGER.info("Reconnecting with backoff after: %s", e)
+            return False
         except aiohttp.ClientError as e:
             _LOGGER.error("WebSocket connection error: %s", e)
             return False
@@ -265,6 +279,8 @@ class WebSocketClient:
             # Route to appropriate handler based on message type
             if self._is_login_response(data):
                 await self._handle_login_response(ws)
+            elif self._is_login_failure(data):
+                await self._handle_login_failure(ws, data)
             elif self._is_error_response(data):
                 await self._handle_error_response(ws, data)
             elif self._is_poll_response(data):
@@ -278,8 +294,12 @@ class WebSocketClient:
             _LOGGER.warning("Error parsing WebSocket message: %s", e)
 
     def _is_login_response(self, data: dict[str, Any]) -> bool:
-        """Check if message is a login response."""
+        """Check if message is a successful login response."""
         return data.get("id") == 1 and data.get("result") is True
+
+    def _is_login_failure(self, data: dict[str, Any]) -> bool:
+        """Check if message is an explicit login rejection by the API."""
+        return data.get("id") == 1 and data.get("result") is False
 
     def _is_error_response(self, data: dict[str, Any]) -> bool:
         """Check if a response indicates a server-side error rather than real data.
@@ -355,16 +375,41 @@ class WebSocketClient:
         must NOT be treated as confirmed-fresh data - doing so would silently
         mask a dead subscription from the coordinator's staleness watchdog.
         A persistently erroring session has not been observed to recover on
-        its own, so force a reconnect rather than retrying the same broken
-        session every poll cycle.
+        its own, so force a reconnect - with backoff, not immediately, since
+        retrying instantly turned a single glitch into an hours-long outage
+        in practice (see _ReconnectWithBackoff).
         """
         error_code = data.get("result", {}).get("errorCode")
         _LOGGER.warning(
-            "MyStiebel API returned errorCode %s for request id %s - forcing reconnect",
+            "MyStiebel API returned errorCode %s for request id %s - forcing reconnect with backoff",
             error_code,
             data.get("id"),
         )
         await ws.close()
+        raise _ReconnectWithBackoff(f"errorCode {error_code}")
+
+    async def _handle_login_failure(
+        self, ws: aiohttp.ClientWebSocketResponse, data: dict[str, Any]
+    ) -> None:
+        """Handle an explicit login rejection from the API (result: False).
+
+        MyStiebelAuth.ensure_valid_token() only checks a hardcoded, assumed
+        24h token lifetime (mystiebel_auth.py does not read the real expiry
+        from the JWT) - it has no way to know the server has already
+        rejected the token. Left alone, every future reconnect attempt would
+        keep reusing the same rejected token and fail identically forever.
+        Clear the cached token here to force a genuine re-authentication on
+        the next connection attempt, and back off instead of retrying
+        immediately.
+        """
+        _LOGGER.error(
+            "WebSocket login rejected by MyStiebel API (result=False) - "
+            "forcing full re-authentication with backoff"
+        )
+        self.auth.token = None
+        self.auth.token_expiry = None
+        await ws.close()
+        raise _ReconnectWithBackoff("login rejected")
 
     async def _handle_initial_data(
         self, ws: aiohttp.ClientWebSocketResponse, data: dict[str, Any]
